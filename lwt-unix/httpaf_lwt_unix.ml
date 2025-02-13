@@ -135,17 +135,16 @@ module Server = struct
               |> ignore;
               read_loop_step ()
             end
-
           | `Yield ->
             Server_connection.yield_reader connection read_loop;
             Lwt.return_unit
-
           | `Close ->
             Lwt.wakeup_later notify_read_loop_exited ();
             if not (Lwt_unix.state socket = Lwt_unix.Closed) then begin
               shutdown socket Unix.SHUTDOWN_RECEIVE
             end;
             Lwt.return_unit
+          | `Upgrade -> Lwt.return_unit
         in
 
         Lwt.async (fun () ->
@@ -167,17 +166,16 @@ module Server = struct
             writev io_vectors >>= fun result ->
             Server_connection.report_write_result connection result;
             write_loop_step ()
-
           | `Yield ->
             Server_connection.yield_writer connection write_loop;
             Lwt.return_unit
-
           | `Close _ ->
             Lwt.wakeup_later notify_write_loop_exited ();
             if not (Lwt_unix.state socket = Lwt_unix.Closed) then begin
               shutdown socket Unix.SHUTDOWN_SEND
             end;
             Lwt.return_unit
+          | `Upgrade -> Lwt.return_unit
         in
 
         Lwt.async (fun () ->

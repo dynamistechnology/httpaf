@@ -121,9 +121,10 @@ module Server = struct
           Server_connection.yield_reader conn reader_thread
         | `Close ->
           (* Log.Global.printf "read_close(%d)%!" (Fd.to_int_exn fd); *)
-          Ivar.fill read_complete ();
+          Ivar.fill_exn read_complete ();
           if not (Fd.is_closed fd)
           then Socket.shutdown socket `Receive
+        | `Upgrade -> ()
       in
       let write_complete = Ivar.create () in
       let rec writer_thread () =
@@ -138,9 +139,10 @@ module Server = struct
           Server_connection.yield_writer conn writer_thread;
         | `Close _ ->
           (* Log.Global.printf "write_close(%d)%!" (Fd.to_int_exn fd); *)
-          Ivar.fill write_complete ();
+          Ivar.fill_exn write_complete ();
           if not (Fd.is_closed fd)
           then Socket.shutdown socket `Send
+        | `Upgrade -> ()
       in
       let conn_monitor = Monitor.create () in
       Scheduler.within ~monitor:conn_monitor reader_thread;
@@ -180,7 +182,7 @@ module Client = struct
           end
       | `Close ->
         (* Log.Global.printf "read_close(%d)%!" (Fd.to_int_exn fd); *)
-        Ivar.fill read_complete ();
+        Ivar.fill_exn read_complete ();
         if not (Fd.is_closed fd)
         then Socket.shutdown socket `Receive
     in
@@ -197,7 +199,7 @@ module Client = struct
         Client_connection.yield_writer conn writer_thread;
       | `Close _ ->
         (* Log.Global.printf "write_close(%d)%!" (Fd.to_int_exn fd); *)
-        Ivar.fill write_complete ();
+        Ivar.fill_exn write_complete ();
     in
     let conn_monitor = Monitor.create () in
     Scheduler.within ~monitor:conn_monitor reader_thread;
