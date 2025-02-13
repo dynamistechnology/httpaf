@@ -273,7 +273,12 @@ let rec read_with_more t bs ~off ~len more =
   );
   (* Keep consuming input as long as progress is made and data is
      available, in case multiple requests were received at once. *)
-  if consumed > 0 && consumed < len then
+   let reader_wants_more =
+     is_active t && match Reqd.output_state (current_reqd_exn t) with
+     | Upgraded -> false
+     | Waiting | Ready | Complete -> true
+   in
+   if consumed > 0 && consumed < len && reader_wants_more then
     let off = off + consumed
     and len = len - consumed in
     consumed + read_with_more t bs ~off ~len more
