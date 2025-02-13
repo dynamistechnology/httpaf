@@ -1,7 +1,10 @@
-type t
+type t [@@deriving sexp]
 
 type name = string
 type value = string
+
+(** Case-insensitive equality for testing header names or values *)
+val ci_equal : string -> string -> bool
 
 val empty : t
 

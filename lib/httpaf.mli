@@ -42,7 +42,6 @@
     vectorized IO. *)
 
 
-open Result
 
 (** {2 Basic HTTP Types} *)
 
@@ -61,6 +60,7 @@ module Version : sig
     { major : int (** The major protocol number. *)
     ; minor : int (** The minor protocol number. *)
     }
+  [@@deriving sexp]
 
   val compare : t -> t -> int
 
@@ -98,12 +98,14 @@ module Method : sig
     | `TRACE
     (** {{:https://tools.ietf.org/html/rfc7231#section-4.3.8} RFC7231§4.3.8}. Safe.*)
     ]
+  [@@deriving sexp]
 
   type t = [
     | standard
     | `Other of string
     (** Methods defined outside of RFC7231, or custom methods. *)
     ]
+  [@@deriving sexp]
 
   val is_safe : standard -> bool
   (** Request methods are considered "safe" if their defined semantics are
@@ -150,6 +152,7 @@ module Status : sig
     | `Continue
     | `Switching_protocols
     ]
+  [@@deriving sexp]
   (** The 1xx (Informational) class of status code indicates an interim
       response for communicating connection status or request progress
       prior to completing the requested action and sending a final
@@ -167,6 +170,7 @@ module Status : sig
     | `Reset_content
     | `Partial_content
     ]
+  [@@deriving sexp]
   (** The 2xx (Successful) class of status code indicates that the client's
       request was successfully received, understood, and accepted.
 
@@ -182,6 +186,7 @@ module Status : sig
     | `Use_proxy
     | `Temporary_redirect
     ]
+  [@@deriving sexp]
   (** The 3xx (Redirection) class of status code indicates that further
       action needs to be taken by the user agent in order to fulfill the
       request.
@@ -212,6 +217,7 @@ module Status : sig
     | `I_m_a_teapot
     | `Enhance_your_calm
     ]
+  [@@deriving sexp]
   (** The 4xx (Client Error) class of status code indicates that the client
       seems to have erred.
 
@@ -226,6 +232,7 @@ module Status : sig
     | `Gateway_timeout
     | `Http_version_not_supported
     ]
+  [@@deriving sexp]
   (** The 5xx (Server Error) class of status code indicates that the server is
       aware that it has erred or is incapable of performing the requested
       method.
@@ -240,11 +247,13 @@ module Status : sig
     | client_error
     | server_error
     ]
+  [@@deriving sexp]
   (** The status codes defined in the HTTP 1.1 RFCs *)
 
   type t = [
     | standard
     | `Code of int ]
+  [@@deriving sexp]
   (** The standard codes along with support for custom codes. *)
 
   val default_reason_phrase : standard -> string
@@ -323,7 +332,7 @@ end
     See {{:https://tools.ietf.org/html/rfc7230#section-3.2} RFC7230§3.2} for
     more details. *)
 module Headers : sig
-  type t
+  type t [@@deriving sexp]
 
   type name = string
   (** The type of a case-insensitive header name. *)
@@ -447,64 +456,80 @@ end
 (** {2 Message Body} *)
 
 module Body : sig
-  type 'rw t
+  module Reader : sig
+    type t
 
-  val schedule_read
-    :  [`read] t
-    -> on_eof  : (unit -> unit)
-    -> on_read : (Bigstringaf.t -> off:int -> len:int -> unit)
-    -> unit
-  (** [schedule_read t ~on_eof ~on_read] will setup [on_read] and [on_eof] as
-      callbacks for when bytes are available in [t] for the application to
-      consume, or when the input channel has been closed and no further bytes
-      will be received by the application.
+    val create : Bigstringaf.t -> t
+    (** [create bs] creates a [t] using [bs] as the internal buffer. *)
 
-      Once either of these callbacks have been called, they become inactive. 
-      The application is responsible for scheduling subsequent reads, either 
-      within the [on_read] callback or by some other mechanism. *)
+    val schedule_read
+      :  t
+      -> on_eof  : (unit -> unit)
+      -> on_read : (Bigstringaf.t -> off:int -> len:int -> unit)
+      -> unit
+    (** [schedule_read t ~on_eof ~on_read] will setup [on_read] and [on_eof] as
+        callbacks for when bytes are available in [t] for the application to
+        consume, or when the input channel has been closed and no further bytes
+        will be received by the application.
 
-  val write_char : [`write] t -> char -> unit
-  (** [write_char w char] copies [char] into an internal buffer. If possible,
-      this write will be combined with previous and/or subsequent writes before
-      transmission. *)
+        Once either of these callbacks have been called, they become inactive.
+        The application is responsible for scheduling subsequent reads, either
+        within the [on_read] callback or by some other mechanism. *)
 
-  val write_string : [`write] t -> ?off:int -> ?len:int -> string -> unit
-  (** [write_string w ?off ?len str] copies [str] into an internal buffer. If
-      possible, this write will be combined with previous and/or subsequent
-      writes before transmission. *)
+    val close : t -> unit
+    (** [close t] closes [t], indicating that any subsequent input
+        received should be discarded. *)
 
-  val write_bigstring : [`write] t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
-  (** [write_bigstring w ?off ?len bs] copies [bs] into an internal buffer. If
-      possible, this write will be combined with previous and/or subsequent
-      writes before transmission. *)
+    val is_closed : t -> bool
+    (** [is_closed t] is [true] if {!close} has been called on [t] and [false]
+        otherwise. A closed [t] may still have bytes available for reading. *)
 
-  val schedule_bigstring : [`write] t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
-  (** [schedule_bigstring w ?off ?len bs] schedules [bs] to be transmitted at
-      the next opportunity without performing a copy. [bs] should not be
-      modified until a subsequent call to {!flush} has successfully 
-      completed. *)
+    val unsafe_faraday : t -> Faraday.t
+    (** [unsafe_faraday t] retrieves the raw Faraday object from [t]. Unsafe. *)
+  end
 
-  val flush : [`write] t -> (unit -> unit) -> unit
-  (** [flush t f] makes all bytes in [t] available for writing to the awaiting
-      output channel. Once those bytes have reached that output channel, [f]
-      will be called.
+  module Writer : sig
+    type t
 
-      The type of the output channel is runtime-dependent, as are guarantees about
-      whether those packets have been queued for delivery or have actually been
-      received by the intended recipient. *)
+    val write_char : t -> char -> unit
+    (** [write_char w char] copies [char] into an internal buffer. If possible,
+        this write will be combined with previous and/or subsequent writes
+        before transmission. *)
 
-  val close_reader : [`read] t -> unit
-  (** [close_reader t] closes [t], indicating that any subsequent input
-      received should be discarded. *)
+    val write_string : t -> ?off:int -> ?len:int -> string -> unit
+    (** [write_string w ?off ?len str] copies [str] into an internal buffer. If
+        possible, this write will be combined with previous and/or subsequent
+        writes before transmission. *)
 
-  val close_writer : [`write] t -> unit
-  (** [close_writer t] closes [t], causing subsequent write calls to raise. If
-      [t] is writable, this will cause any pending output to become available
-      to the output channel. *)
+    val write_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+    (** [write_bigstring w ?off ?len bs] copies [bs] into an internal buffer. If
+        possible, this write will be combined with previous and/or subsequent
+        writes before transmission. *)
 
-  val is_closed : _ t -> bool
-  (** [is_closed t] is [true] if {!close} has been called on [t] and [false]
-      otherwise. A closed [t] may still have pending output. *)
+    val schedule_bigstring : t -> ?off:int -> ?len:int -> Bigstringaf.t -> unit
+    (** [schedule_bigstring w ?off ?len bs] schedules [bs] to be transmitted at
+        the next opportunity without performing a copy. [bs] should not be
+        modified until a subsequent call to {!flush} has successfully
+        completed. *)
+
+    val flush : t -> (unit -> unit) -> unit
+    (** [flush t f] makes all bytes in [t] available for writing to the awaiting
+        output channel. Once those bytes have reached that output channel, [f]
+        will be called.
+
+        The type of the output channel is runtime-dependent, as are guarantees
+        about whether those packets have been queued for delivery or have
+        actually been received by the intended recipient. *)
+
+    val close : t -> unit
+    (** [close t] closes [t], causing subsequent write calls to raise. If
+        [t] is writable, this will cause any pending output to become available
+        to the output channel. *)
+
+    val is_closed : t -> bool
+    (** [is_closed t] is [true] if {!close} has been called on [t] and [false]
+        otherwise. A closed [t] may still have pending output. *)
+  end
 
 end
 
@@ -520,6 +545,7 @@ module Request : sig
     ; target  : string
     ; version : Version.t
     ; headers : Headers.t }
+  [@@deriving sexp]
 
   val create
     :  ?version:Version.t (** default is HTTP 1.1 *)
@@ -528,11 +554,17 @@ module Request : sig
     -> string
     -> t
 
-  val body_length : t -> [
-    | `Fixed of Int64.t
-    | `Chunked
-    | `Error of [`Bad_request]
-  ]
+  module Body_length : sig
+    type t = [
+      | `Fixed of Int64.t
+      | `Chunked
+      | `Error of [`Bad_request]
+    ]
+
+    val pp_hum : Format.formatter -> t -> unit
+  end
+
+  val body_length : t -> Body_length.t
   (** [body_length t] is the length of the message body accompanying [t]. It is
       an error to generate a request with a close-delimited message body.
 
@@ -560,6 +592,7 @@ module Response : sig
     ; status  : Status.t
     ; reason  : string
     ; headers : Headers.t }
+  [@@deriving sexp]
 
   val create
     :  ?reason:string     (** default is determined by {!Status.default_reason_phrase} *)
@@ -571,12 +604,18 @@ module Response : sig
       the given parameters. For typical use cases, it's sufficient to provide
       values for [headers] and [status]. *)
 
-  val body_length : ?proxy:bool -> request_method:Method.standard -> t -> [
-    | `Fixed of Int64.t
-    | `Chunked
-    | `Close_delimited
-    | `Error of [ `Bad_gateway | `Internal_server_error ]
-  ]
+  module Body_length : sig
+    type t = [
+      | `Fixed of Int64.t
+      | `Chunked
+      | `Close_delimited
+      | `Error of [ `Bad_gateway | `Internal_server_error ]
+    ]
+
+    val pp_hum : Format.formatter -> t -> unit
+  end
+
+  val body_length : ?proxy:bool -> request_method:Method.standard -> t -> Body_length.t
   (** [body_length ?proxy ~request_method t] is the length of the message body
       accompanying [t] assuming it is a response to a request whose method was
       [request_method]. If the calling code is acting as a proxy, it should
@@ -618,7 +657,7 @@ module Reqd : sig
   type t
 
   val request : t -> Request.t
-  val request_body : t -> [`read] Body.t
+  val request_body : t -> Body.Reader.t
 
   val response : t -> Response.t option
   val response_exn : t -> Response.t
@@ -635,7 +674,9 @@ module Reqd : sig
 
   val respond_with_string    : t -> Response.t -> string -> unit
   val respond_with_bigstring : t -> Response.t -> Bigstringaf.t -> unit
-  val respond_with_streaming : ?flush_headers_immediately:bool -> t -> Response.t -> [`write] Body.t
+  val respond_with_streaming : ?flush_headers_immediately:bool -> t -> Response.t -> Body.Writer.t
+
+  val respond_with_upgrade : ?reason:string -> t -> Headers.t -> unit
 
   (** {3 Exception Handling} *)
 
@@ -668,7 +709,7 @@ module Server_connection : sig
   type request_handler = Reqd.t -> unit
 
   type error_handler =
-    ?request:Request.t -> error -> (Headers.t -> [`write] Body.t) -> unit
+    ?request:Request.t -> error -> (Headers.t -> Body.Writer.t) -> unit
 
   val create
     :  ?config:Config.t
@@ -678,7 +719,7 @@ module Server_connection : sig
   (** [create ?config ?error_handler ~request_handler] creates a connection
       handler that will service individual requests with [request_handler]. *)
 
-  val next_read_operation : t -> [ `Read | `Yield | `Close ]
+  val next_read_operation : t -> [ `Read | `Yield | `Close | `Upgrade ]
   (** [next_read_operation t] returns a value describing the next operation
       that the caller should conduct on behalf of the connection. *)
 
@@ -690,7 +731,7 @@ module Server_connection : sig
       connection to consume. *)
 
   val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
-  (** [read_eof t bigstring ~off ~len] reads bytes of input from the provided 
+  (** [read_eof t bigstring ~off ~len] reads bytes of input from the provided
       range of [bigstring] and returns the number of bytes consumed by the
       connection.  {!read_eof} should be called after {!next_read_operation}
       returns a [`Read] and an EOF has been received from the communication
@@ -705,6 +746,7 @@ module Server_connection : sig
   val next_write_operation : t -> [
     | `Write of Bigstringaf.t IOVec.t list
     | `Yield
+    | `Upgrade
     | `Close of int ]
   (** [next_write_operation t] returns a value describing the next operation
       that the caller should conduct on behalf of the connection. *)
@@ -755,8 +797,9 @@ module Client_connection : sig
 
   type error =
     [ `Malformed_response of string | `Invalid_response_body_length of Response.t | `Exn of exn ]
+  [@@deriving sexp_of]
 
-  type response_handler = Response.t -> [`read] Body.t  -> unit
+  type response_handler = Response.t -> Body.Reader.t  -> unit
 
   type error_handler = error -> unit
 
@@ -765,7 +808,7 @@ module Client_connection : sig
     -> Request.t
     -> error_handler:error_handler
     -> response_handler:response_handler
-    -> [`write] Body.t * t
+    -> Body.Writer.t * t
 
   val next_read_operation : t -> [ `Read | `Close ]
   (** [next_read_operation t] returns a value describing the next operation
@@ -779,7 +822,7 @@ module Client_connection : sig
       connection to consume. *)
 
   val read_eof : t -> Bigstringaf.t -> off:int -> len:int -> int
-  (** [read_eof t bigstring ~off ~len] reads bytes of input from the provided 
+  (** [read_eof t bigstring ~off ~len] reads bytes of input from the provided
       range of [bigstring] and returns the number of bytes consumed by the
       connection.  {!read_eof} should be called after {!next_read_operation}
       returns a [`Read] and an EOF has been received from the communication

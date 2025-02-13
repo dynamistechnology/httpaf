@@ -31,22 +31,42 @@
     POSSIBILITY OF SUCH DAMAGE.
   ----------------------------------------------------------------------------*)
 
+open Sexplib.Std
+
 type t =
   { meth    : Method.t
   ; target  : string
   ; version : Version.t
   ; headers : Headers.t }
+[@@deriving sexp]
 
 let create ?(version=Version.v1_1) ?(headers=Headers.empty) meth target =
   { meth; target; version; headers }
 
 let bad_request = `Error `Bad_request
-let body_length { headers; _ } =
-  (* XXX(seliopou): perform proper transfer-encoding parsing *)
-  match Headers.get_multi headers "transfer-encoding" with
-  | "chunked"::_                             -> `Chunked
-  | _        ::es when List.mem "chunked" es -> `Error `Bad_request
-  | [] | _                                   ->
+
+module Body_length = struct
+  type t = [
+    | `Fixed of Int64.t
+    | `Chunked
+    | `Error of [`Bad_request]
+  ]
+
+  let pp_hum fmt (len : t) =
+    match len with
+    | `Fixed n -> Format.fprintf fmt "Fixed %Li" n
+    | `Chunked -> Format.pp_print_string fmt "Chunked"
+    | `Error `Bad_request -> Format.pp_print_string fmt "Error: Bad request"
+  ;;
+end
+
+let body_length { headers; _ } : Body_length.t =
+  (* The last entry in transfer-encoding is the correct entry. We only accept
+     chunked transfer-encodings. *)
+  match List.rev (Headers.get_multi headers "transfer-encoding") with
+  | value::_ when Headers.ci_equal value "chunked" -> `Chunked
+  | _    ::_ -> bad_request
+  | [] ->
     begin match Message.unique_content_length_values headers with
     | []      -> `Fixed 0L
     | [ len ] ->
@@ -63,3 +83,8 @@ let persistent_connection ?proxy { version; headers; _ } =
 let pp_hum fmt { meth; target; version; headers } =
   Format.fprintf fmt "((method \"%a\") (target %S) (version \"%a\") (headers %a))"
     Method.pp_hum meth target Version.pp_hum version Headers.pp_hum headers
+
+let is_upgrade t =
+  match Headers.get t.headers "Connection" with
+  | None -> false
+  | Some header_val -> Headers.ci_equal header_val "upgrade"

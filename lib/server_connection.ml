@@ -53,7 +53,7 @@ type error =
   [ `Bad_gateway | `Bad_request | `Internal_server_error | `Exn of exn]
 
 type error_handler =
-  ?request:Request.t -> error -> (Headers.t -> [`write] Body.t) -> unit
+  ?request:Request.t -> error -> (Headers.t -> Body.Writer.t) -> unit
 
 type t =
   { reader                 : Reader.request
@@ -64,14 +64,14 @@ type t =
   ; request_queue          : Reqd.t Queue.t
     (* invariant: If [request_queue] is not empty, then the head of the queue
        has already had [request_handler] called on it. *)
+  ; mutable is_errored     : bool
+    (* if there is a parse or connection error, we invoke the [error_handler]
+       and set [is_errored] to indicate we should not close the writer yet. *)
   ; mutable wakeup_reader  : Optional_thunk.t
   }
 
 let is_closed t =
   Reader.is_closed t.reader && Writer.is_closed t.writer
-
-let is_waiting t =
-  not (is_closed t) && Queue.is_empty t.request_queue
 
 let is_active t =
   not (Queue.is_empty t.request_queue)
@@ -81,7 +81,7 @@ let current_reqd_exn t =
 
 let yield_reader t k =
   if is_closed t
-  then failwith "on_wakeup_reader on closed conn"
+  then failwith "yield_reader on closed conn"
   else if Optional_thunk.is_some t.wakeup_reader
   then failwith "yield_reader: only one callback can be registered at a time"
   else t.wakeup_reader <- Optional_thunk.some k
@@ -108,8 +108,8 @@ let default_error_handler ?request:_ error handle =
     | (#Status.client_error | #Status.server_error) as error -> Status.to_string error
   in
   let body = handle Headers.empty in
-  Body.write_string body message;
-  Body.close_writer body
+  Body.Writer.write_string body message;
+  Body.Writer.close body
 ;;
 
 let create ?(config=Config.default) ?(error_handler=default_error_handler) request_handler =
@@ -134,6 +134,7 @@ let create ?(config=Config.default) ?(error_handler=default_error_handler) reque
   ; request_handler = request_handler
   ; error_handler   = error_handler
   ; request_queue
+  ; is_errored      = false
   ; wakeup_reader   = Optional_thunk.none
   }
 
@@ -144,6 +145,7 @@ let shutdown_reader t =
   else wakeup_reader t
 
 let shutdown_writer t =
+  if is_active t then Reqd.flush_response_body (current_reqd_exn t);
   Writer.close t.writer;
   if is_active t
   then Reqd.close_request_body (current_reqd_exn t)
@@ -166,6 +168,7 @@ let set_error_and_handle ?request t error =
     let reqd = current_reqd_exn t in
     Reqd.report_error reqd error
   end else begin
+    t.is_errored <- true;
     let status =
       match (error :> [error | Status.standard]) with
       | `Exn _                     -> `Internal_server_error
@@ -174,66 +177,91 @@ let set_error_and_handle ?request t error =
     shutdown_reader t;
     let writer = t.writer in
     t.error_handler ?request error (fun headers ->
-      Writer.write_response writer (Response.create ~headers status);
-      Body.writer_of_faraday (Writer.faraday writer)
+      let response = Response.create ~headers status in
+      Writer.write_response writer response;
+      let encoding =
+        (* If we haven't parsed the request method, just use GET as a standard
+           placeholder. The method is only used for edge cases, like HEAD or
+           CONNECT. *)
+        let request_method =
+          match request with
+          | None -> `GET
+          | Some request -> request.meth
+        in
+        match Response.body_length ~request_method response with
+        | `Fixed _ | `Close_delimited as encoding -> encoding
+        | `Chunked ->
+          (* XXX(dpatti): Because we pass the writer's faraday directly to the
+             new body, we don't write the chunked encoding. A client won't be
+             able to interpret this. *)
+          `Close_delimited
+        | `Error (`Bad_gateway | `Internal_server_error) ->
+          failwith "httpaf.Server_connection.error_handler: invalid response body length"
+      in
+      Body.Writer.of_faraday (Writer.faraday writer) ~encoding
         ~when_ready_to_write:(fun () -> Writer.wakeup writer));
   end
 
 let report_exn t exn =
   set_error_and_handle t (`Exn exn)
 
-let advance_request_queue_if_necessary t =
-  if is_active t then begin
-    let reqd = current_reqd_exn t in
-    if Reqd.persistent_connection reqd then begin
-      if Reqd.is_complete reqd then begin
-        ignore (Queue.take t.request_queue);
-        if not (Queue.is_empty t.request_queue)
-        then t.request_handler (current_reqd_exn t);
-        wakeup_reader t;
-      end
-    end else begin
-      (* Take the head of the queue, close the remaining request bodies, clear
-       * the queue, and push the head back on. We do not plan on processing any
-       * more requests after the current one. *)
-      ignore (Queue.take t.request_queue);
-      Queue.iter Reqd.close_request_body t.request_queue;
-      Queue.clear t.request_queue;
-      Queue.push reqd t.request_queue;
-      if Reqd.is_complete reqd
-      then shutdown t
-      else
-        match Reqd.input_state reqd with
-        | Ready -> ()
-        | Complete -> shutdown_reader t
-    end
-  end else if Reader.is_closed t.reader
-  then shutdown t
+let advance_request_queue t =
+  ignore (Queue.take t.request_queue);
+  if not (Queue.is_empty t.request_queue)
+  then t.request_handler (Queue.peek_exn t.request_queue);
+;;
 
-let _next_read_operation t =
-  advance_request_queue_if_necessary t;
-  if is_active t
+let rec _next_read_operation t =
+  if not (is_active t)
   then (
+    (* If the request queue is empty, there is no connection error, and the
+       reader is closed, then we can assume that no more user code will be able
+       to write. *)
+    if Reader.is_closed t.reader && not t.is_errored
+    then shutdown_writer t;
+    Reader.next t.reader
+  ) else (
     let reqd = current_reqd_exn t in
     match Reqd.input_state reqd with
+    | Waiting  -> `Yield
     | Ready    -> Reader.next t.reader
-    | Complete ->
-      if Reqd.persistent_connection reqd
-      then `Yield
-      else (
-        shutdown_reader t;
-        Reader.next t.reader)
+    | Complete -> _final_read_operation_for t reqd
+    | Upgraded -> `Upgrade
   )
-  else Reader.next t.reader
+
+and _final_read_operation_for t reqd =
+  if not (Reqd.persistent_connection reqd) then (
+    shutdown_reader t;
+    Reader.next t.reader;
+  ) else (
+    match Reqd.output_state reqd with
+    | Waiting | Ready ->
+      (* XXX(dpatti): This is a way in which the reader and writer are not
+         parallel -- we tell the writer when it needs to yield but the reader is
+         always asking for more data. This is the only branch in either
+         operation function that does not return `(Reader|Writer).next`, which
+         means there are surprising states you can get into. For example, we ask
+         the runtime to yield but then raise when it tries to because the reader
+         is closed. I don't think checking `is_closed` here makes sense
+         semantically, but I don't think checking it in `_next_read_operation`
+         makes sense either. I chose here so I could describe why. *)
+      if Reader.is_closed t.reader
+      then Reader.next t.reader
+      else `Yield
+    | Upgraded -> `Upgrade
+    | Complete ->
+      advance_request_queue t;
+      _next_read_operation t;
+  )
 ;;
 
 let next_read_operation t =
   match _next_read_operation t with
   | `Error (`Parse _)             -> set_error_and_handle          t `Bad_request; `Close
   | `Error (`Bad_request request) -> set_error_and_handle ~request t `Bad_request; `Close
-  | (`Read | `Yield | `Close) as operation -> operation
+  | (`Read | `Yield | `Close | `Upgrade) as operation -> operation
 
-let read_with_more t bs ~off ~len more =
+let rec read_with_more t bs ~off ~len more =
   let call_handler = Queue.is_empty t.request_queue in
   let consumed = Reader.read_with_more t.reader bs ~off ~len more in
   if is_active t
@@ -243,7 +271,14 @@ let read_with_more t bs ~off ~len more =
     then t.request_handler reqd;
     Reqd.flush_request_body reqd;
   );
-  consumed
+  (* Keep consuming input as long as progress is made and data is
+     available, in case multiple requests were received at once. *)
+  if consumed > 0 && consumed < len then
+    let off = off + consumed
+    and len = len - consumed in
+    consumed + read_with_more t bs ~off ~len more
+  else
+    consumed
 ;;
 
 let read t bs ~off ~len =
@@ -252,13 +287,49 @@ let read t bs ~off ~len =
 let read_eof t bs ~off ~len =
   read_with_more t bs ~off ~len Complete
 
-let next_write_operation t =
-  advance_request_queue_if_necessary t;
-  if is_active t
-  then (
+let rec _next_write_operation t =
+  if not (is_active t)
+  then Writer.next t.writer
+  else (
     let reqd = current_reqd_exn t in
-    Reqd.flush_response_body reqd);
-  Writer.next t.writer
+    match Reqd.output_state reqd with
+    | Waiting -> Writer.next t.writer
+    | Ready ->
+      Reqd.flush_response_body reqd;
+      Writer.next t.writer
+    | Complete -> _final_write_operation_for t reqd ~upgrade:false
+    | Upgraded -> _final_write_operation_for t reqd ~upgrade:true
+  )
+
+and _final_write_operation_for t reqd ~upgrade =
+  let next =
+    if upgrade then (
+      if Writer.has_pending_output t.writer then
+        (* Even in the Upgrade case, we're still responsible for writing the response
+           header, so we might have work to do. *)
+        Writer.next t.writer
+      else
+        `Upgrade
+    ) else if not (Reqd.persistent_connection reqd) then (
+      shutdown_writer t;
+      Writer.next t.writer;
+    ) else (
+      match Reqd.input_state reqd with
+      | Waiting -> `Yield
+      | Ready -> Writer.next t.writer;
+      | Upgraded -> `Upgrade
+      | Complete ->
+        advance_request_queue t;
+        _next_write_operation t;
+    )
+  in
+  (* The only reason the reader yields is to wait for the writer, so we need to
+     notify it that we've completed. *)
+  wakeup_reader t;
+  next
+;;
+
+let next_write_operation t = _next_write_operation t
 
 let report_write_result t result =
   Writer.report_result t.writer result
