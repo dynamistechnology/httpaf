@@ -17,6 +17,8 @@ depends: [
   "bigstringaf" {>= "0.4.0"}
   "angstrom" {>= "0.14.0"}
   "faraday"  {>= "0.6.1"}
+  "sexplib"
+  "ppx_sexp_conv"
 ]
 synopsis:
   "A high-performance, memory-efficient, and scalable web server for OCaml"
